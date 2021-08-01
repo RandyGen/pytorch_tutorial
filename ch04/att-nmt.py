@@ -82,49 +82,36 @@ with open('data/train.ja', 'r', encoding='utf-8') as f:
 
 
 # Define model
-class MyNMT(nn.Module):
+class MyAttNMT(nn.Module):
     def __init__(self, jv, ev, k):
-        super(MyNMT, self).__init__()
+        super(MyAttNMT, self).__init__()
         self.jemb = nn.Embedding(jv, k)
         self.eemb = nn.Embedding(ev, k)
         self.lstm1 = nn.LSTM(k, k, num_layers=2, batch_first=True)
         self.lstm2 = nn.LSTM(k, k, num_layers=2, batch_first=True)
+        self.Wc = nn.Linear(2*k, k)
         self.W = nn.Linear(k, ev)
     def forward(self, jline, eline):
         x = self.jemb(jline)
         ox, (hnx, cnx) = self.lstm1(x)
         y = self.eemb(eline)
         oy, (hny, cny) = self.lstm1(y,(hnx, cnx))
-        out = self.W(oy)
-        return out
+        ox1 = ox.permute(0,2,1)
+        sim = torch.bmm(oy, ox1)
+        bs, yws, xws = sim.shape
+        sim2 = sim.reshape(bs*yws, xws)
+        alpha = F.softmax(sim2, dim=1).reshape(bs, yws, xws)
+        ct = torch.bmm(alpha, ox)
+        oy1 = torch.cat([ct, oy], dim=2)
+        oy2 = self.Wc(oy1)
+        return self.W(oy2)
 
 
 # model generate, optimizer and criterion setting
 demb = 200
-net = MyNMT(jv, ev, demb).to(device)
+net = MyAttNMT(jv, ev, demb).to(device)
 optimizer = optim.SGD(net.parameters(),lr=0.01)
 criterion = nn.CrossEntropyLoss()
-
-
-# Learn
-net.train()
-for epoch in range(200):
-    loss1k = 0.0
-    for i in range(len(jdata)):
-        jinput = torch.LongTensor([jdata[i][1:]]).to(device)
-        einput = torch.LongTensor([edata[i][:-1]]).to(device)
-        out = net(jinput, einput)
-        gans = torch.LongTensor([edata[i][1:]]).to(device)
-        loss = criterion(out[0], gans[0])
-        loss1k += loss.item()
-        if (i % 100 == 0):
-            print(epoch, i, loss1k)
-            loss1k = 0.0
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    outfile = "model/nmt-" +str(epoch) + ".model"
-    torch.save(net.state_dict().outfile)
 
 
 # test
@@ -135,15 +122,23 @@ with torch.no_grad():
     for i in range(len(jdata)):
         jinput = torch.LongTensor([jdata[i][1:]]).to(device)
         x = net.jemb(jinput)
-        ox, (hn, cn) = net.lstm1(x)
+        ox, (hnx, cnx) = net.lstm1(x)
         wid = esid
         s1 = 0
         while True:
             wids = torch.LongTensor([[wid]]).to(device)
             y = net.eemb(wids)
-            oy, (hn, cn) = net.lstm2(y, (hn, cn))
-            oy1 = net.W(oy)
-            wid = torch.argmax(F.softmax(oy1[0],dim=1)).item()
+            oy, (hnx, cnx) = net.lstm2(y, (hnx, cnx))
+            ox1 = ox.permute(0, 2, 1)
+            sim = torch.bmm(oy, ox1)
+            bs, yws, xws = sim.shape
+            sim2 = sim.reshape(bs*yws, xws)
+            alpha =F.softmax(sim2,dim=1).reshape(bs, yws, xws)
+            ct = torch.bmm(alpha, ox)
+            oy1 = torch.cat([ct, oy1],dim=2)
+            oy2 = net.Wc(oy1)
+            oy3 = net.W(oy2)
+            wid = torch.argmax(oy3[0]).item()
             if (wid == eeid):
                 break
             print(eid2w[wid], ' ', end='')
@@ -153,3 +148,29 @@ with torch.no_grad():
         print()
 
 
+# Learn
+net.train()
+for ep in range(20):
+    i = 0
+    for xs, ys in dataloader:
+        xs1, ys1, ys2 = [], [], []
+        for k in range(len(xs)):
+            tid = xs[k]
+            xs1.append(torch.LongTensor(tid[1:]))
+            tid = ys[k]
+            ys1.append(torch.LongTensor(tid[:-1]))
+            ys2.append(torch.LongTensor(tid[1:]))
+        jinput = pad_sequence(xs1, batch_first=True).to(device)
+        einput = pad_sequence(ys1, batch_first=True).to(device)
+        gans = pad_sequence(ys1, batch_first=True, padding_value=-1.0).to(device)
+        out = net(jinput, einput)
+        loss = criterion(out[0], gans[0])
+        for h in range(1, len(gans)):
+            loss += criterion(out[h], gans[h])
+        print(ep, i, loss.item())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        i += 1
+    outfile = "model/attnmt2-" +str(ep) + ".model"
+    torch.save(net.state_dict().outfile)
